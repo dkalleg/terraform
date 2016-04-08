@@ -427,12 +427,12 @@ func resourceVSphereVirtualMachineCreate(d *schema.ResourceData, meta interface{
 	}
 
 	if vm.template != "" {
-		err := vm.deployVirtualMachine(client)
+		err := vm.deployVirtualMachine(d, client)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := vm.createVirtualMachine(client)
+		err := vm.createVirtualMachine(d, client)
 		if err != nil {
 			return err
 		}
@@ -862,7 +862,7 @@ func findDatastore(c *govmomi.Client, sps types.StoragePlacementSpec) (*object.D
 }
 
 // createVirtualMachine creates a new VirtualMachine.
-func (vm *virtualMachine) createVirtualMachine(c *govmomi.Client) error {
+func (vm *virtualMachine) createVirtualMachine(d *schema.ResourceData, c *govmomi.Client) error {
 	dc, err := getDatacenter(c, vm.datacenter)
 
 	if err != nil {
@@ -1027,19 +1027,23 @@ func (vm *virtualMachine) createVirtualMachine(c *govmomi.Client) error {
 	}
 
 	if vm.bootableVmdkPath != "" {
-        newVM.PowerOn(context.TODO())
+		newVM.PowerOn(context.TODO())
 		ip, err := newVM.WaitForIP(context.TODO())
 		if err != nil {
 			return err
 		}
 		log.Printf("[DEBUG] ip address: %v", ip)
+
+		d.SetConnInfo(map[string]string{
+			"host": ip,
+		})
 	}
 
 	return nil
 }
 
 // deployVirtualMachine deploys a new VirtualMachine.
-func (vm *virtualMachine) deployVirtualMachine(c *govmomi.Client) error {
+func (vm *virtualMachine) deployVirtualMachine(d *schema.ResourceData, c *govmomi.Client) error {
 	dc, err := getDatacenter(c, vm.datacenter)
 	if err != nil {
 		return err
@@ -1298,6 +1302,9 @@ func (vm *virtualMachine) deployVirtualMachine(c *govmomi.Client) error {
 	if err != nil {
 		return err
 	}
+	d.SetConnInfo(map[string]string{
+		"host": ip,
+	})
 	log.Printf("[DEBUG] ip address: %v", ip)
 
 	return nil
