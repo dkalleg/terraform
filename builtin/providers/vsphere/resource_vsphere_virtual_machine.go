@@ -86,6 +86,7 @@ type virtualMachine struct {
 	dnsServers            []string
 	hasBootableVmdk       bool
 	linkedClone           bool
+	markAsTemplate        bool
 	skipCustomization     bool
 	windowsOptionalConfig windowsOptConfig
 	customConfigurations  map[string](types.AnyType)
@@ -197,6 +198,12 @@ func resourceVSphereVirtualMachine() *schema.Resource {
 				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				ForceNew: true,
+			},
+
+			"mark_as_template": &schema.Schema{
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
 			},
 
 			"skip_customization": &schema.Schema{
@@ -467,6 +474,46 @@ func resourceVSphereVirtualMachineUpdate(d *schema.ResourceData, meta interface{
 		return err
 	}
 
+	var resourcePool *object.ResourcePool
+	resourcePool, err = vm.ResourcePool(context.TODO())
+	if err != nil {
+		resourcePool, err = finder.DefaultResourcePool(context.TODO())
+		if err != nil {
+			return fmt.Errorf("[ERROR] Couldn't get the ResourcePool for this vm: %#v", err)
+		}
+	}
+
+	var host *object.HostSystem
+	host, err = vm.HostSystem(context.TODO())
+	if err != nil {
+		host, err = finder.DefaultHostSystem(context.TODO())
+		if err != nil {
+			return fmt.Errorf("[ERROR] Couldn't get the HostSystem for this vm: %#v", err)
+		}
+	}
+
+	// If resource is a template, convert to vm to update
+	var wasTemplate bool
+	var markTemplate bool
+	if d.HasChange("mark_as_template") {
+		old, new := d.GetChange("mark_as_template")
+		oldMark := old.(bool)
+		newMark := new.(bool)
+		if oldMark {
+			wasTemplate = true
+		}
+		if newMark {
+			markTemplate = true
+		}
+	} else if v, ok := d.GetOk("mark_as_template"); ok && v.(bool) {
+		wasTemplate = true
+		markTemplate = true
+	}
+
+	if wasTemplate {
+		vm.MarkAsVirtualMachine(context.TODO(), *resourcePool, host)
+	}
+
 	if d.HasChange("disk") {
 		hasChanges = true
 		oldDisks, newDisks := d.GetChange("disk")
@@ -557,12 +604,26 @@ func resourceVSphereVirtualMachineUpdate(d *schema.ResourceData, meta interface{
 
 	// do nothing if there are no changes
 	if !hasChanges {
+		if markTemplate {
+			// If resource was not a template, it would have been a powered on vm
+			if !wasTemplate {
+				task, err := vm.PowerOff(context.TODO())
+				if err != nil {
+					return err
+				}
+				err = task.Wait(context.TODO())
+				if err != nil {
+					return err
+				}
+			}
+			vm.MarkAsTemplate(context.TODO())
+		}
 		return nil
 	}
 
 	log.Printf("[DEBUG] virtual machine config spec: %v", configSpec)
 
-	if rebootRequired {
+	if rebootRequired && !wasTemplate {
 		log.Printf("[INFO] Shutting down virtual machine: %s", d.Id())
 
 		task, err := vm.PowerOff(context.TODO())
@@ -588,7 +649,7 @@ func resourceVSphereVirtualMachineUpdate(d *schema.ResourceData, meta interface{
 		log.Printf("[ERROR] %s", err)
 	}
 
-	if rebootRequired {
+	if rebootRequired && !markTemplate {
 		task, err = vm.PowerOn(context.TODO())
 		if err != nil {
 			return err
@@ -598,13 +659,17 @@ func resourceVSphereVirtualMachineUpdate(d *schema.ResourceData, meta interface{
 		if err != nil {
 			log.Printf("[ERROR] %s", err)
 		}
+
+		ip, err := vm.WaitForIP(context.TODO())
+		if err != nil {
+			return err
+		}
+		log.Printf("[DEBUG] ip address: %v", ip)
 	}
 
-	ip, err := vm.WaitForIP(context.TODO())
-	if err != nil {
-		return err
+	if markTemplate {
+		vm.MarkAsTemplate(context.TODO())
 	}
-	log.Printf("[DEBUG] ip address: %v", ip)
 
 	return resourceVSphereVirtualMachineRead(d, meta)
 }
@@ -667,6 +732,10 @@ func resourceVSphereVirtualMachineCreate(d *schema.ResourceData, meta interface{
 		}
 	} else {
 		vm.dnsServers = DefaultDNSServers
+	}
+
+	if v, ok := d.GetOk("mark_as_template"); ok {
+		vm.markAsTemplate = v.(bool)
 	}
 
 	if vL, ok := d.GetOk("custom_configuration_parameters"); ok {
@@ -871,12 +940,33 @@ func resourceVSphereVirtualMachineRead(d *schema.ResourceData, meta interface{})
 		return nil
 	}
 
+	var networkLabel []string
+	devices, _ := vm.Device(context.TODO())
+	for _, device := range devices {
+		if devices.Type(device) == "ethernet" {
+			// if value, ok := v.(types.VirtualVmxnet3); ok {
+			log.Printf("[FINDME] vmxnet3 in read - Type: %T", device)
+			log.Printf("[FINDME] vmxnet3 in read - v: %#v", device)
+
+			if v, ok := device.(*types.VirtualVmxnet3); ok {
+				networkLabel = append(networkLabel, v.Backing.(*types.VirtualEthernetCardNetworkBackingInfo).DeviceName)
+			} else if v, ok := device.(*types.VirtualE1000); ok {
+				networkLabel = append(networkLabel, v.Backing.(*types.VirtualEthernetCardNetworkBackingInfo).DeviceName)
+			}
+
+			log.Printf("[FINDME] vmxnet3 in read - network label: %#v", networkLabel)
+
+		}
+	}
+
 	var mvm mo.VirtualMachine
 
-	// wait for interfaces to appear
-	_, err = vm.WaitForNetIP(context.TODO(), true)
-	if err != nil {
-		return err
+	// wait for interfaces to appear unless resource is a template
+	if v, ok := d.GetOk("mark_as_template"); ok && !v.(bool) {
+		_, err = vm.WaitForNetIP(context.TODO(), true)
+		if err != nil {
+			return err
+		}
 	}
 
 	collector := property.DefaultCollector(client.Client)
@@ -948,10 +1038,15 @@ func resourceVSphereVirtualMachineRead(d *schema.ResourceData, meta interface{})
 		return fmt.Errorf("Invalid disks to set: %#v", disks)
 	}
 
+	log.Printf("[DEBUG] datacenter %#v", dc)
+	log.Printf("[DEBUG] mvm %#v", mvm)
+	log.Printf("[DEBUG] mvm.Summary.Config %#v", mvm.Summary.Config)
+	log.Printf("[DEBUG] mvm.Guest.Net %#v", mvm.Guest.Net)
+
 	networkInterfaces := make([]map[string]interface{}, 0)
 	for _, v := range mvm.Guest.Net {
 		if v.DeviceConfigId >= 0 {
-			log.Printf("[DEBUG] v.Network - %#v", v.Network)
+			log.Printf("[DEBUG] v.Network %#v", v.Network)
 			networkInterface := make(map[string]interface{})
 			networkInterface["label"] = v.Network
 			for _, ip := range v.IpConfig.IpAddress {
@@ -998,17 +1093,29 @@ func resourceVSphereVirtualMachineRead(d *schema.ResourceData, meta interface{})
 			}
 		}
 	}
+
+	if v, ok := d.GetOk("mark_as_template"); ok && v == true {
+		for _, v := range networkLabel {
+			networkInterface := make(map[string]interface{})
+			networkInterface["label"] = v
+			networkInterfaces = append(networkInterfaces, networkInterface)
+		}
+
+	}
+
 	log.Printf("[DEBUG] networkInterfaces: %#v", networkInterfaces)
 	err = d.Set("network_interface", networkInterfaces)
 	if err != nil {
 		return fmt.Errorf("Invalid network interfaces to set: %#v", networkInterfaces)
 	}
 
-	log.Printf("[DEBUG] ip address: %v", networkInterfaces[0]["ipv4_address"].(string))
-	d.SetConnInfo(map[string]string{
-		"type": "ssh",
-		"host": networkInterfaces[0]["ipv4_address"].(string),
-	})
+	if v, ok := d.GetOk("mark_as_template"); ok && v == false {
+		log.Printf("[DEBUG] ip address: %v", networkInterfaces[0]["ipv4_address"].(string))
+		d.SetConnInfo(map[string]string{
+			"type": "ssh",
+			"host": networkInterfaces[0]["ipv4_address"].(string),
+		})
+	}
 
 	var rootDatastore string
 	for _, v := range mvm.Datastore {
@@ -1022,10 +1129,10 @@ func resourceVSphereVirtualMachineRead(d *schema.ResourceData, meta interface{})
 				return err
 			}
 			rootDatastore = msp.Name
-			log.Printf("[DEBUG] %#v", msp.Name)
+			log.Printf("[DEBUG] msp.Name: %#v", msp.Name)
 		} else {
 			rootDatastore = md.Name
-			log.Printf("[DEBUG] %#v", md.Name)
+			log.Printf("[DEBUG] md.Name: %#v", md.Name)
 		}
 		break
 	}
@@ -1797,8 +1904,17 @@ func (vm *virtualMachine) setupVirtualMachine(c *govmomi.Client) error {
 		log.Printf("[DEBUG] VM customization finished")
 	}
 
-	if vm.hasBootableVmdk || vm.template != "" {
-		newVM.PowerOn(context.TODO())
+	if vm.markAsTemplate {
+		newVM.MarkAsTemplate(context.TODO())
+	} else if vm.hasBootableVmdk || vm.template != "" {
+		task, err := newVM.PowerOn(context.TODO())
+		if err != nil {
+			return fmt.Errorf("[ERROR] Failed to power on vm: %v", err)
+		}
+		err = task.Wait(context.TODO())
+		if err != nil {
+			return fmt.Errorf("[ERROR] Failure during power on: %v", err)
+		}
 	}
 	return nil
 }
